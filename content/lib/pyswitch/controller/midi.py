@@ -1,5 +1,5 @@
 # MIDI Message types: These are all needed to be imported, despite not used: If not, no messages
-# will go through the MIDI routings. If you encounter that messages are not forwarded, the type 
+# will go through the MIDI routings. If you encounter that messages are not forwarded, the type
 # might perhaps miss here. (not all are enabled by default to minimize RAM usage).
 # If the message type (status) is not known by the adafruit_midi library at all, you can implement
 # the type yourself (see MidiClockMessage below)
@@ -9,10 +9,10 @@ from adafruit_midi.control_change import ControlChange
 from adafruit_midi.program_change import ProgramChange
 from adafruit_midi.system_exclusive import SystemExclusive
 #from adafruit_midi.mtc_quarter_frame import MtcQuarterFrame
-#from adafruit_midi.channel_pressure import ChannelPressure
-#from adafruit_midi.note_off import NoteOff
-#from adafruit_midi.note_on import NoteOn
-#from adafruit_midi.pitch_bend import PitchBend
+from adafruit_midi.channel_pressure import ChannelPressure
+from adafruit_midi.note_off import NoteOff
+from adafruit_midi.note_on import NoteOn
+from adafruit_midi.pitch_bend import PitchBend
 #from adafruit_midi.timing_clock import TimingClock
 #from adafruit_midi.start import Start
 #from adafruit_midi.stop import Stop
@@ -38,14 +38,14 @@ class MidiRouting:
     APPLICATION = 1
 
     def __init__(self, source, target):
-        # Source MIDI device (can be either a AdafruitXXXMidiDevice or 
+        # Source MIDI device (can be either a AdafruitXXXMidiDevice or
         # MidiController.PYSWITCH for the application itself)
-        self.source = source    
+        self.source = source
 
-        # Target MIDI device (can be either a AdafruitXXXMidiDevice or 
+        # Target MIDI device (can be either a AdafruitXXXMidiDevice or
         # MidiController.PYSWITCH for the application itself)
-        self.target = target    
-        
+        self.target = target
+
 
 ##################################################################################################
 
@@ -63,11 +63,11 @@ class MidiController:
 
     def send(self, midi_message):
         # Send to all routings which have APPLICATION as source
-        for r in self.__routings_from_appl:    
+        for r in self.__routings_from_appl:
             r.target.send(midi_message)
 
     def receive(self):
-        # Process routings without APPLICATION involved 
+        # Process routings without APPLICATION involved
         self.__process_external_routings()
 
         # Process routings targeting APPLICATION
@@ -76,14 +76,14 @@ class MidiController:
 
             if msg:
                 # Return first message for APPLICATION in the queue (next ticks will deliver the next messages)
-                return msg                
-    
+                return msg
+
     # Process all routings where APPLICATION is not involved (this processes one message of each source every time)
     def __process_external_routings(self):
         routings = self.__routings_external
         if not routings:
             return
-        
+
         # Get all sources messages
         sources = []
         results = []
@@ -94,7 +94,7 @@ class MidiController:
 
             sources.append(r.source)
             results.append(r.source.receive())
-            
+
         # Distribute messages
         for r in routings:
             for i in range(len(sources)):
@@ -102,16 +102,16 @@ class MidiController:
                     continue
 
                 msg = results[i]
-        
+
                 if not msg:
                     continue
-                
+
                 if isinstance(msg, MIDIUnknownEvent):
                     continue
-                
+
                 if getattr(msg, "_STATUS", None) is None:
                     continue
-                
+
                 r.target.send(msg)
 
                 break

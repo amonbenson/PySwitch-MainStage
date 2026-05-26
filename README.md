@@ -1,5 +1,7 @@
 # PySwitch MIDI Controller Firmware
 
+> **This fork reconfigures the MIDICaptain STD as a DIN MIDI ↔ USB MIDI bridge for Apple MainStage (or any DAW/host).** Kemper amplifier support is intentionally disabled. See the [MainStage / DIN-to-USB Bridge Configuration](#mainstage--din-to-usb-bridge-configuration) section at the bottom for the full description of changes made and why.
+
 This project provides an open source firmware for CircuitPython Microcontroller based MIDI controllers. It can control devices via MIDI based on a generic configuration script. 
 
 The project has been developed for controling Kemper Profilers, but the framework itself is generic, so it can be adapted for other devices easily. Until now, the following devices are supported out of the box:
@@ -1132,6 +1134,116 @@ Wrote HTML report to /project/test/report/index.html
 You should find a coverage report in the test/report folder like this:
 
 ![image](https://github.com/user-attachments/assets/c539aaad-704a-44b5-9408-2f19c8d4da67)
+
+## MainStage / DIN-to-USB Bridge Configuration
+
+This fork configures the MIDICaptain STD as a **transparent DIN MIDI ↔ USB MIDI bridge** for use with Apple MainStage (or any DAW/host). No Kemper amplifier is required. The changes below were made against PySwitch firmware **2.4.8**.
+
+### Changes Made
+
+#### 1. `content/communication.py` — DIN bridge routing
+
+The original file used `KemperBidirectionalProtocol` and only routed `APPLICATION → USB`. It was replaced with a three-way routing that:
+
+- Forwards DIN MIDI input to USB output (DIN → USB)
+- Forwards USB host output back to DIN output (USB → DIN)
+- Routes button/expression-pedal messages from the application to USB (APPLICATION → USB)
+
+The `USB → APPLICATION` routing is deliberately omitted. If USB were listed as both an external source (for the `USB → DIN` route) and a to-APPLICATION source, `MidiController.receive()` would read the USB device twice per tick, splitting messages alternately between the DIN target and the application — causing every other USB message to be lost.
+
+```python
+from pyswitch.controller.midi import MidiRouting
+from pyswitch.hardware.devices.pa_midicaptain import PA_MIDICAPTAIN_DIN_MIDI, PA_MIDICAPTAIN_USB_MIDI
+
+_DIN_MIDI = PA_MIDICAPTAIN_DIN_MIDI(in_channel=None, out_channel=0)
+_USB_MIDI = PA_MIDICAPTAIN_USB_MIDI(in_channel=None, out_channel=0)
+
+Communication = {
+    "midi": {
+        "routings": [
+            MidiRouting(source=_DIN_MIDI,                  target=_USB_MIDI),  # DIN → USB
+            MidiRouting(source=_USB_MIDI,                  target=_DIN_MIDI),  # USB → DIN
+            MidiRouting(source=MidiRouting.APPLICATION,    target=_USB_MIDI),  # buttons/pedals → USB
+        ]
+    }
+}
+```
+
+#### 2. `content/lib/pyswitch/controller/midi.py` — Enable additional MIDI message types
+
+By default PySwitch only imports CC, PC, and SysEx message types for the adafruit_midi parser. Any unregistered type arrives as `MIDIUnknownEvent` and is silently filtered by `__process_external_routings()`. For a general-purpose bridge, NoteOn, NoteOff, PitchBend, and ChannelPressure must also be registered:
+
+```python
+from adafruit_midi.channel_pressure import ChannelPressure
+from adafruit_midi.note_off import NoteOff
+from adafruit_midi.note_on import NoteOn
+from adafruit_midi.pitch_bend import PitchBend
+```
+
+TimingClock, Start, and Stop remain commented out — enabling them would flood the receive loop at 24 ppqn and degrade performance.
+
+#### 3. `content/lib/pyswitch/hardware/adafruit/AdafruitDinMidiDevice.py` — MIDI running-status support
+
+**Root cause of stuck/missing notes when playing chords:** The MIDI running-status optimisation allows a keyboard to omit repeated status bytes for consecutive messages of the same type (e.g., a chord sends `NoteOn(C)` as three bytes then `NoteOn(E)` as only two data bytes, relying on the receiver to remember the status). The adafruit_midi library has no running-status support. Its `from_message_bytes()` parser skips all leading data bytes (MSB not set) at the start of a message and then discards them permanently — so every note after the first in a chord is silently lost.
+
+**Source:** [adafruit_midi `midi_message.py` on GitHub](https://github.com/adafruit/Adafruit_CircuitPython_MIDI/blob/main/adafruit_midi/midi_message.py) — the relevant loop in `from_message_bytes()`:
+
+```python
+while msgstartidx <= endidx and not midibytes[msgstartidx] & 0x80:
+    msgstartidx += 1
+if msgstartidx > endidx:
+    return (None, endidx + 1, skipped)   # all data bytes consumed and discarded
+```
+
+**Fix:** A `_RunningStatusUART` wrapper is inserted between the raw `busio.UART` object and the adafruit_midi `MIDI` instance. It intercepts every `read(n)` call, tracks the most recent channel-message status byte, and re-inserts it before any data byte that begins a new running-status message. adafruit_midi then sees a fully-formed message and parses it correctly.
+
+Key implementation details:
+- System Realtime bytes (≥ 0xF8, e.g. MIDI Clock) pass through without cancelling running status — per the MIDI 1.0 spec.
+- SysEx (0xF0) cancels running status and is handled separately.
+- The raw UART is still used directly as `midi_out` (the send path is unaffected).
+
+```python
+class _RunningStatusUART:
+    _MSG_LEN = {
+        0x80: 3, 0x90: 3, 0xA0: 3, 0xB0: 3,  # NoteOff, NoteOn, PolyPress, CC
+        0xC0: 2, 0xD0: 2,                       # ProgramChange, ChannelPressure
+        0xE0: 3,                                 # PitchBend
+    }
+    # ... (see AdafruitDinMidiDevice.py for full implementation)
+
+class AdafruitDinMidiDevice:
+    def __init__(self, gpio_in, gpio_out, in_buf_size, baudrate, timeout,
+                 in_channel=None, out_channel=0):
+        midi_uart = _UART(gpio_in, gpio_out, baudrate=baudrate, timeout=timeout)
+        self.__midi = _MIDI(
+            midi_out=midi_uart,
+            out_channel=out_channel,
+            midi_in=_RunningStatusUART(midi_uart),  # running-status wrapper
+            in_channel=in_channel,
+            in_buf_size=in_buf_size
+        )
+```
+
+### Button and Display Configuration
+
+`content/inputs.py` and `content/display.py` configure the 10-button layout for MainStage control:
+
+| Switch | CC | Purpose |
+|--------|----|---------|
+| Switch 1 | CC 102 | Panic (sends 127 on press, 0 on release) |
+| Switch 2 | CC 103 | — |
+| Switch 3 | CC 104 | — |
+| Switch 4 | CC 105 | — |
+| Switch A | CC 106 | — |
+| Switch B | CC 107 | — |
+| Switch C | CC 108 | — |
+| Switch D | CC 109 | — |
+| Switch UP | CC 119 | Previous Patch |
+| Switch DOWN | CC 118 | Next Patch |
+
+Expression Pedal 1 is mapped to the Kemper Wah pedal CC (`MAPPING_WAH_PEDAL`). All messages are sent as channel 1 CC (value 127 on press, 0 on release) via USB MIDI to the host.
+
+---
 
 ## License
 
