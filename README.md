@@ -61,7 +61,9 @@ It would particularly be nice to add support for Line6 and FRactal devices, if a
 ## Startup Options
 
 When the controller device is powered up with the pyswitch firmware installed, you have the following options:
-- Press and hold switch 1 to mount the USB drive.
+- Press and hold switch 1 to mount the USB drive. In this fork the firmware is then not started at
+  all — the display shows a `USB DRIVE MODE` notice and the device idles until it is power cycled,
+  so that copying files to the drive cannot be disturbed by the running application.
 
 ## Configuration Files
 
@@ -1223,6 +1225,54 @@ class AdafruitDinMidiDevice:
             in_buf_size=in_buf_size
         )
 ```
+
+#### 4. `content/code.py` — USB drive mode no longer runs the firmware
+
+**Symptom:** Holding switch 1 while powering up mounts the USB drive as documented, but the drive drops
+off the computer roughly three seconds later — around the time the firmware finishes starting up — and
+cannot be read or written any more until the device is power cycled.
+
+Upstream PySwitch treats switch 1 purely as a `boot.py` flag: the drive is left mounted and the firmware
+then boots and runs normally on top of it, so the application and the host work on the same device at the
+same time. `content/code.py` makes it a real mode instead. When the drive is mounted, the firmware is not
+started at all: the display shows a `USB DRIVE MODE` notice and the board idles until it is power cycled.
+
+The mode is detected by asking who may write to `/`. In USB drive mode `boot.py` deliberately does not
+remount it, so it is writable for the host and read-only for CircuitPython; in normal operation it is the
+other way round. Opening a file for writing therefore tells the two apart, and
+[`vfs_fat_file.c`](https://github.com/adafruit/circuitpython/blob/7.3.x/extmod/vfs_fat_file.c) makes that
+check before the file is touched. The probe file is created once and then stays as an empty file, so
+later boots do not write to the flash at all:
+
+```python
+_PROBE_FILE = "/.usb_drive_check"
+
+def _usb_drive_enabled():
+    try:
+        open(_PROBE_FILE, "ab").close()
+    except OSError:
+        return True
+    return False
+```
+
+**Do not use `storage.remount()` for this detection.** It only refuses to run once the host has actually
+mounted the drive — `ejected[]` starts out as `true` in
+[`usb_msc_flash.c`](https://github.com/adafruit/circuitpython/blob/7.3.x/supervisor/shared/usb/usb_msc_flash.c)
+and is cleared by `usb_msc_mount()` — so this early in the boot it usually succeeds instead of raising, and
+`common_hal_storage_remount()` then calls `filesystem_set_internal_writable_by_usb(false)`, which makes the
+drive **read-only for the host**. Recovering from that needs the serial REPL.
+
+#### 5. `content/boot.py` — auto-reload on CircuitPython 8 and later
+
+Fixed in passing, unrelated to the symptom above. `boot.py` started with
+`from supervisor import disable_autoreload`, which existed up to CircuitPython 7 and was
+[removed in CircuitPython 8](https://github.com/adafruit/circuitpython/blob/8.0.x/shared-bindings/supervisor/__init__.c)
+in favour of `supervisor.runtime.autoreload`. On CircuitPython 8 and later that import raises `ImportError`,
+which aborts the *entire* `boot.py` before any of its work runs — the USB drive would be exposed on every
+boot, `/` would stay read-only for CircuitPython (breaking PyMidiBridge saves), and auto-reload would stay
+enabled. The MIDICaptain ships with CircuitPython 7.3.1, so this only bites after a firmware update.
+Auto-reload is now switched off through a helper that tries both APIs and swallows `AttributeError`, called
+*after* the USB drive handling so that a failure there cannot skip `disable_usb_drive()`.
 
 ### Button and Display Configuration
 
